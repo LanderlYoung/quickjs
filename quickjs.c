@@ -177,6 +177,7 @@ enum {
     JS_CLASS_ASYNC_GENERATOR_FUNCTION,  /* u.func */
     JS_CLASS_ASYNC_GENERATOR,   /* u.async_generator_data */
     JS_CLASS_WEAKREF,           /* u.weakref */
+    JS_CLASS_FINALIZATION_REGISTRY,     /* u.finalization_registry */
 
     JS_CLASS_INIT_COUNT, /* last entry for predefined classes */
 };
@@ -453,6 +454,8 @@ struct JSContext {
     int interrupt_counter;
 
     struct list_head loaded_modules; /* list of JSModuleDef.link */
+
+    struct JSFinalizationHelper *finalization_helper; /* finalization related store */
 
     /* if NULL, RegExp compilation is not supported */
     JSValue (*compile_regexp)(JSContext *ctx, JSValueConst pattern,
@@ -917,6 +920,11 @@ typedef struct JSWeakRef {
     JSValueConst target;
 } JSWeakRef;
 
+typedef struct JSFinalizationRegistry {
+    JSValue callback;
+    struct list_head record_list; /* list JSFinalizationRecord */
+} JSFinalizationRegistry;
+
 struct JSObject {
     union {
         JSGCObjectHeader header;
@@ -962,6 +970,7 @@ struct JSObject {
         struct JSAsyncFromSyncIteratorData *async_from_sync_iterator_data; /* JS_CLASS_ASYNC_FROM_SYNC_ITERATOR */
         struct JSAsyncGeneratorData *async_generator_data; /* JS_CLASS_ASYNC_GENERATOR */
         struct JSWeakRef *weakref; /* JS_CLASS_WEAKREF */
+        struct JSFinalizationRegistry *finalization_registry; /* JS_CLASS_FINALIZATION_REGISTRY */
         struct { /* JS_CLASS_BYTECODE_FUNCTION: 12/24 bytes */
             /* also used by JS_CLASS_GENERATOR_FUNCTION, JS_CLASS_ASYNC_FUNCTION and JS_CLASS_ASYNC_GENERATOR_FUNCTION */
             struct JSFunctionBytecode *function_bytecode;
@@ -1358,6 +1367,9 @@ static JSHashEntry *js_hash_map_find_entry(JSHashMap *map, void *key);
 static int js_hash_map_add_entry(JSRuntime *rt, JSHashMap *map, JSHashEntry *entry);
 static void js_hash_map_del_entry(JSRuntime *rt, JSHashMap *map, JSHashEntry *entry);
 static int js_hash_map_iterate_next_entry(JSHashMap *map, JSHashMapIterator *it);
+
+static void js_free_pending_jobs_for_context(JSContext *ctx);
+static void js_free_context_finalization_helper(JSContext *ctx);
 
 static const JSClassExoticMethods js_arguments_exotic_methods;
 static const JSClassExoticMethods js_string_exotic_methods;
@@ -1896,17 +1908,21 @@ void JS_SetSharedArrayBufferFunctions(JSRuntime *rt,
     rt->sab_funcs = *sf;
 }
 
-/* return 0 if OK, < 0 if exception */
-int JS_EnqueueJob(JSContext *ctx, JSJobFunc *job_func,
-                  int argc, JSValueConst *argv)
+/* return 0 if OK, < 0 if fail */
+static int js_enqueue_job_internal(JSContext *ctx, JSJobFunc *job_func,
+                            int argc, JSValueConst *argv, BOOL nothrow)
 {
     JSRuntime *rt = ctx->rt;
     JSJobEntry *e;
     int i;
 
-    e = js_malloc(ctx, sizeof(*e) + argc * sizeof(JSValue));
-    if (!e)
+    e = js_malloc_rt(rt, sizeof(*e) + argc * sizeof(JSValue));
+    if (!e) {
+        if (!nothrow) {
+            JS_ThrowOutOfMemory(ctx);
+        }
         return -1;
+    }
     e->ctx = ctx;
     e->job_func = job_func;
     e->argc = argc;
@@ -1915,6 +1931,20 @@ int JS_EnqueueJob(JSContext *ctx, JSJobFunc *job_func,
     }
     list_add_tail(&e->link, &rt->job_list);
     return 0;
+}
+
+/* return 0 if OK, < 0 if exception */
+int JS_EnqueueJob(JSContext *ctx, JSJobFunc *job_func,
+                  int argc, JSValueConst *argv)
+{
+    return js_enqueue_job_internal(ctx, job_func, argc, argv, FALSE);
+}
+
+/* This function is guaranteed not to touch the JS contex, eg. new/free js object.
+   return 0 if OK, < 0 if fail */
+static inline int js_enqueue_job_safe(JSContext *ctx, JSJobFunc *job_func)
+{
+    return js_enqueue_job_internal(ctx, job_func, 0, NULL, TRUE);
 }
 
 BOOL JS_IsJobPending(JSRuntime *rt)
@@ -1951,6 +1981,25 @@ int JS_ExecutePendingJob(JSRuntime *rt, JSContext **pctx)
     js_free(ctx, e);
     *pctx = ctx;
     return ret;
+}
+
+/* remove all pendind jobs using this context */
+static void js_free_pending_jobs_for_context(JSContext *ctx)
+{
+    JSRuntime *rt = ctx->rt;
+    struct list_head *el, *el1;
+
+    list_for_each_safe(el, el1, &rt->job_list) {
+        JSJobEntry *e = list_entry(el, JSJobEntry, link);
+        if (e->ctx == ctx) {
+            int i;
+            list_del(&e->link);
+            for(i = 0; i < e->argc; i++) {
+                JS_FreeValueRT(rt, e->argv[i]);
+            }
+            js_free(ctx, e);
+        }
+    }
 }
 
 static inline uint32_t atom_get_free(const JSAtomStruct *p)
@@ -2077,6 +2126,7 @@ void JS_FreeRuntime(JSRuntime *rt)
     }
 #endif
     assert(list_empty(&rt->gc_obj_list));
+    assert(list_empty(&rt->job_list));
 
     /* free the classes */
     for(i = 0; i < rt->class_count; i++) {
@@ -2267,6 +2317,7 @@ JSContext *JS_NewContext(JSRuntime *rt)
     JS_AddIntrinsicPromise(ctx);
     JS_AddIntrinsicBigInt(ctx);
     JS_AddIntrinsicWeakRef(ctx);
+    JS_AddIntrinsicFinalizationRegistry(ctx);
     return ctx;
 }
 
@@ -2402,6 +2453,9 @@ void JS_FreeContext(JSContext *ctx)
         JS_DumpMemoryUsage(stdout, &stats, rt);
     }
 #endif
+
+    js_free_pending_jobs_for_context(ctx);
+    js_free_context_finalization_helper(ctx);
 
     js_free_modules(ctx, JS_FREE_MODULE_ALL);
 
@@ -47312,6 +47366,34 @@ static void js_weak_ref_free_runtime_map(JSRuntime *rt)
     rt->weak_target_map = NULL;
 }
 
+/* check if target is a valid object for weak ref, accoiding to specs
+   if TRUE, return object pointer and set has_weak_ref
+   otherwise throw exception and return NULL */
+static void *__js_weak_ref_get_target_ptr(JSContext *ctx, JSValueConst target, BOOL *has_weak_ref)
+{
+    /* the spec says: Thrown if target is not an object or a non-registered symbol. */
+    if (JS_IsSymbol(target)) {
+        JSAtomStruct *p = JS_VALUE_GET_PTR(target);
+        if (p->atom_type == JS_ATOM_TYPE_GLOBAL_SYMBOL) {
+            JS_ThrowTypeError(ctx, "registered symbol is not allowed");
+            return NULL;
+        }
+        if (has_weak_ref) {
+            *has_weak_ref = p->has_weak_ref;
+        }
+        return p;
+    } else if (JS_IsObject(target)) {
+        JSObject *p = JS_VALUE_GET_OBJ(target);
+        if (has_weak_ref) {
+            *has_weak_ref = p->has_weak_ref;
+        }
+        return p;
+    } else {
+        JS_ThrowTypeError(ctx, "not a valid target");
+        return NULL;
+    }
+}
+
 /* find the weak_ref_list of a Object or Symbol/Atom,
    on failure: return NULL and throw exception */
 static JSWeakTargetRecord *js_weak_ref_obtain_target_record(JSContext *ctx, JSValueConst target)
@@ -47323,21 +47405,8 @@ static JSWeakTargetRecord *js_weak_ref_obtain_target_record(JSContext *ctx, JSVa
     JSHashEntry *entry = NULL;
     JSWeakTargetRecord *record;
 
-    /* the spec says: Thrown if target is not an object or a non-registered symbol. */
-    if (JS_IsSymbol(target)) {
-        JSAtomStruct *p = JS_VALUE_GET_PTR(target);
-        if (p->atom_type == JS_ATOM_TYPE_GLOBAL_SYMBOL) {
-            JS_ThrowTypeError(ctx, "registered symbol is not allowed");
-            return NULL;
-        }
-        target_ptr = p;
-        has_weak_ref = p->has_weak_ref;
-    } else if (JS_IsObject(target)) {
-        JSObject *p = JS_VALUE_GET_OBJ(target);
-        target_ptr = p;
-        has_weak_ref = p->has_weak_ref;
-    } else {
-        JS_ThrowTypeError(ctx, "not a valid target");
+    target_ptr = __js_weak_ref_get_target_ptr(ctx, target, &has_weak_ref);
+    if (!target_ptr) {
         return NULL;
     }
 
@@ -47437,7 +47506,9 @@ static void js_weak_ref_reset(JSRuntime *rt, JSValueConst target)
     list_for_each(el, list) {
         JSWeakRecord *wr = list_entry(el, JSWeakRecord, list);
         assert(wr->operations);
-        wr->operations->reset_weak_ref_first_pass(rt, wr);
+        if (wr->operations->reset_weak_ref_first_pass) {
+            wr->operations->reset_weak_ref_first_pass(rt, wr);
+        }
     }
 
     /* second pass to free the values to avoid modifying the weak
@@ -47447,7 +47518,9 @@ static void js_weak_ref_reset(JSRuntime *rt, JSValueConst target)
         list_del(el);
 
         assert(wr->operations);
-        wr->operations->reset_weak_ref_second_pass(rt, wr);
+        if (wr->operations->reset_weak_ref_second_pass) {
+            wr->operations->reset_weak_ref_second_pass(rt, wr);
+        }
     }
 
     js_hash_map_del_entry(rt, rt->weak_target_map, entry);
@@ -47579,7 +47652,6 @@ void JS_AddIntrinsicWeakRef(JSContext *ctx)
         init_class_range(ctx->rt, js_weak_class_def, JS_CLASS_WEAKREF,
                          countof(js_weak_class_def));
     }
-
     proto = JS_NewObject(ctx);
     ctx->class_proto[JS_CLASS_WEAKREF] = proto;
     JS_SetPropertyFunctionList(ctx, proto,
@@ -47588,6 +47660,392 @@ void JS_AddIntrinsicWeakRef(JSContext *ctx)
     JS_NewGlobalCConstructorOnly(ctx, "WeakRef",
                              js_weakref_constructor, 1,
                              proto);
+}
+
+/*
+  FinalizationRegistry
+
+  IMPLEMENTATION DETAIL:
+    - It is hard to call a js function when Object is freed, while still
+        respect to the principle that one can't touch js context in finalization.
+    - In order to implement that, we shcedule a job (with JS_EnqueueJob)
+        to perform callback when an Object is GCed.
+
+  MEMORY STRUCTURE:
+    - FR for FinalizatioRecord
+
+          ---------------------------------------------
+          | JSContext->finalization_helper            |
+          ---------------------------------------------
+       -->| * registered_items                        |
+       |  ---------------------------------------------
+       |  | * scheduled_items                         | <--
+       |  ---------------------------------------------   |
+       |                                                  |
+       |                                                  |
+       |<---------------------------     ------------------
+       |                           |     |
+       |<--------------------      |     |
+                            |      |     |
+  ---------------------------------------------
+  |  FinalizationRegistry | FR1 | FR2 | FR3   |
+  ---------------------------------------------
+                            ↑     ↑     ↑
+  -------------------       |     |     x
+  | target Object 1 | <--weak     |     | u
+  -------------------             |     x l
+                                  |     | i
+  -------------------             |     x n
+  | target Object 2 | <--weak-----|     | k
+  -------------------                   x e
+                                        | d
+  -------------------                   x
+  | target Object 3 | (already GCed) <--|
+  -------------------
+ */
+typedef struct JSFinalizationRecord {
+    JSFinalizationRegistry *this_obj;
+    /* Pointing to the registered context, when context is freed, this pointer is set to NULL,
+       If target is GCed after context-free, we can fail safe.
+       Notice: this is actually a "weak reference" to context. */
+    JSContext *context;
+
+    struct list_head list_in_registry; /* JSFinalizationRegistry.record_list */
+    struct list_head list_in_context;  /* JSFinalizationHelper.scheduled_records/registered_records */
+    JSWeakRecord weak_record;
+
+    /* WeakRef to token, or undefined if not given
+       Note: The spec does require `token` be a valid target for WeakRef,
+         but doesn't require it to be weakly held, nor does test262.
+       However, tests show Chrome/Firefox/Safari all implemented as WeakRef. */
+    JSValue token_weakref;
+    JSValue held_value;
+} JSFinalizationRecord;
+
+typedef struct JSFinalizationHelper {
+    struct list_head registered_records; /* list of JSFinalizationRecord */
+    struct list_head scheduled_records;  /* list of JSFinalizationRecord to callback */
+    BOOL has_schedule_callback_job;      /* already enqueued a job */
+} JSFinalizationHelper;
+
+static void js_finalization_registry_free_record(JSRuntime *rt, JSFinalizationRecord* r)
+{
+    r->this_obj = NULL;
+    r->context = NULL;
+    JS_FreeValueRT(rt, r->token_weakref);
+    JS_FreeValueRT(rt, r->held_value);
+    /* if target Object is still alive */
+    if (r->weak_record.list.next != NULL) {
+        js_weak_ref_unlink(&r->weak_record);
+    }
+    /* if JSContext is still alive */
+    if (r->list_in_context.next != NULL) {
+        list_del(&r->list_in_context);
+    }
+    /* unlink from FinalizationRegistry */
+    list_del(&r->list_in_registry);
+
+    js_free_rt(rt, r);
+}
+
+/* get or create, on allocation failure return NULL and throw exception */
+static JSFinalizationHelper *js_init_context_finalization_helper(JSContext *ctx)
+{
+    if (!ctx->finalization_helper) {
+        JSFinalizationHelper *helper = js_malloc(ctx, sizeof(*helper));
+        if (unlikely(!helper)) {
+            return NULL;
+        }
+        init_list_head(&helper->registered_records);
+        init_list_head(&helper->scheduled_records);
+        helper->has_schedule_callback_job = FALSE;
+        ctx->finalization_helper = helper;
+    }
+    return ctx->finalization_helper;
+}
+
+static void js_free_context_finalization_helper(JSContext *ctx)
+{
+    JSFinalizationHelper *helper = ctx->finalization_helper;
+    struct list_head *el, *el1;
+    if (helper) {
+        /* context is released, invalidate all record.context */
+        list_for_each_safe(el, el1, &helper->registered_records) {
+            JSFinalizationRecord* record = list_entry(el, JSFinalizationRecord, list_in_context);
+            record->context = NULL; /* act as a "weak reference" to context */
+            list_del(el);
+        }
+
+        list_for_each_safe(el, el1, &helper->scheduled_records) {
+            JSFinalizationRecord* record = list_entry(el, JSFinalizationRecord, list_in_context);
+            js_finalization_registry_free_record(ctx->rt, record);
+        }
+        js_free(ctx, helper);
+        ctx->finalization_helper = NULL;
+    }
+}
+
+static JSValue js_finalization_callback_registry_job(JSContext *ctx, int _, JSValueConst *__)
+{
+    JSFinalizationHelper *helper = ctx->finalization_helper;
+    struct list_head *el, *el1;
+
+    assert(helper);
+    list_for_each_safe(el, el1, &helper->scheduled_records) {
+        JSFinalizationRecord *r = list_entry(el, JSFinalizationRecord, list_in_context);
+        JSValueConst callback = r->this_obj->callback;
+        JSValueConst args[] = { r->held_value };
+
+        /* callback to FinalizationRegistry */
+        JSValue res = JS_Call(ctx, callback, ctx->global_obj, countof(args), args);
+        if (JS_IsException(res)) {
+            /* ignore exception */
+            JS_FreeValue(ctx, JS_GetException(ctx));
+        } else {
+            JS_FreeValue(ctx, res);
+        }
+
+        js_finalization_registry_free_record(ctx->rt, r);
+    }
+    helper->has_schedule_callback_job = FALSE;
+
+    return JS_UNDEFINED;
+}
+
+static void js_finalization_schedule_job(JSContext *ctx)
+{
+    JSFinalizationHelper *helper = ctx->finalization_helper;
+    if (!helper->has_schedule_callback_job) {
+        helper->has_schedule_callback_job =
+            !js_enqueue_job_safe(ctx, js_finalization_callback_registry_job);
+    }
+}
+
+static void js_finalization_item_reset_weak_ref_second_pass(JSRuntime *rt, JSWeakRecord *wr)
+{
+    /* There is a "race condition" that target and held_value in a reference cycle,
+       they get GCed in the same pass.
+       To be noticed that held_value are referenced by this FR,
+       if the above scenario is formed, means the cycle must also contain the FR itself.
+
+       So, no matter which one is finalized first, we end up with the FinalizationItem be freed.
+       Conclusion: the "race condition" is safe, we don't need to use JS_IsLiveObject to check object liveness. */
+    JSFinalizationRecord *record = container_of(wr, JSFinalizationRecord, weak_record);
+    if (record->context) { /* context is still alive */
+        assert(record->context->finalization_helper);
+
+        list_del(&record->list_in_context); /* remove form registered_records */
+        list_add(&record->list_in_context,  /* add to scheduled_records */
+                 &record->context->finalization_helper->scheduled_records);
+
+        js_finalization_schedule_job(record->context);
+    } else {
+        /* context released, free the record */
+        js_finalization_registry_free_record(rt, record);
+    }
+}
+
+static const struct JSWeakRecordOperations js_finalization_item_operations = {
+    NULL, js_finalization_item_reset_weak_ref_second_pass,
+};
+
+static JSValue js_finalization_registry_constructor(JSContext *ctx, JSValueConst new_target,
+                                  int argc, JSValueConst *argv)
+{
+    JSValueConst callback = argv[0];
+    JSValue this_val;
+
+    if (!JS_IsFunction(ctx, callback)) {
+        return JS_ThrowTypeError(ctx, "callback is not a function");
+    }
+    if (!js_init_context_finalization_helper(ctx)) {
+        return JS_EXCEPTION;
+    }
+
+    this_val = js_create_from_ctor(ctx, new_target, JS_CLASS_FINALIZATION_REGISTRY);
+    if (!JS_IsException(this_val)) {
+        JSObject *obj = JS_VALUE_GET_OBJ(this_val);
+        JSFinalizationRegistry *reg = reg = js_malloc(ctx, sizeof(*reg));
+        if (unlikely(!reg)) {
+            return JS_EXCEPTION;
+        }
+        reg->callback = JS_DupValue(ctx, callback);
+        init_list_head(&reg->record_list);
+
+        obj->u.finalization_registry = reg;
+    }
+
+    return this_val;
+}
+
+static JSValue js_finalization_registry_register(JSContext *ctx, JSValueConst this_val,
+                                                  int argc, JSValueConst *argv)
+{
+    JSValueConst target = argv[0];
+    JSValueConst held_value = argv[1];
+    JSValueConst token = argc > 2 ? argv[2] : JS_UNDEFINED;
+
+    JSObject *p;
+    JSFinalizationRegistry *reg;
+    JSFinalizationRecord *record;
+    JSWeakTargetRecord *weak_target_record;
+
+    if (!JS_IsObject(this_val) ||
+        (p = JS_VALUE_GET_OBJ(this_val))->class_id != JS_CLASS_FINALIZATION_REGISTRY) {
+        return JS_ThrowTypeError(ctx, "not a FinalizationRegistry");
+    }
+    reg = p->u.finalization_registry;
+
+    // param check: conform to specs
+    weak_target_record = js_weak_ref_obtain_target_record(ctx, target);
+    if (unlikely(!weak_target_record)) {
+        return JS_EXCEPTION;
+    }
+    if (!JS_IsUndefined(token) && !__js_weak_ref_get_target_ptr(ctx, token, NULL)) {
+        return JS_EXCEPTION;
+    }
+    if (js_strict_eq(ctx, target, held_value)) {
+        return JS_ThrowTypeError(ctx, "target cannot === heldValue");
+    }
+
+    record = js_malloc(ctx, sizeof(*record));
+    if (unlikely(!record)) {
+        return JS_EXCEPTION;
+    }
+
+    /* init record */
+    record->this_obj = reg;
+    record->context = ctx;
+    init_list_head(&record->list_in_registry);
+    init_list_head(&record->list_in_context);
+    js_weak_record_init(&record->weak_record, &js_finalization_item_operations);
+    record->held_value = JS_DupValue(ctx, held_value);
+    if (!JS_IsUndefined(token)) {
+        /* make a weakref to token */
+        JSValue weakref = JS_NewWeakRef(ctx, token);
+        if (unlikely(JS_IsException(weakref))) {
+            js_finalization_registry_free_record(ctx->rt, record);
+            return JS_EXCEPTION;
+        }
+        record->token_weakref = weakref;
+    } else {
+        record->token_weakref = JS_UNDEFINED;
+    }
+
+    /* wire things up */
+    js_weak_ref_add_record(ctx, weak_target_record, &record->weak_record);
+    list_add(&record->list_in_registry, &reg->record_list);
+    assert(ctx->finalization_helper);
+    list_add(&record->list_in_context, &ctx->finalization_helper->registered_records);
+
+    return JS_UNDEFINED;
+}
+
+static JSValue js_finalization_registry_unregister(JSContext *ctx, JSValueConst this_val,
+                                                  int argc, JSValueConst *argv)
+{
+    JSValueConst token = argv[0];
+    BOOL removed = FALSE;
+    struct list_head *el, *el1;
+
+    JSObject *p;
+    JSFinalizationRegistry *reg;
+    if (!JS_IsObject(this_val) ||
+        (p = JS_VALUE_GET_OBJ(this_val))->class_id != JS_CLASS_FINALIZATION_REGISTRY) {
+        return JS_ThrowTypeError(ctx, "not a FinalizationRegistry");
+    }
+    reg = p->u.finalization_registry;
+
+    if (!__js_weak_ref_get_target_ptr(ctx, token, NULL)) {
+        return JS_EXCEPTION;
+    }
+    list_for_each_safe(el, el1, &reg->record_list) {
+        JSFinalizationRecord *r = list_entry(el, JSFinalizationRecord, list_in_registry);
+        if (!JS_IsUndefined(r->token_weakref)) {
+            JSValue deref = JS_DerefWeakRef(ctx, r->token_weakref);
+            assert(!JS_IsException(deref));
+            if (!JS_IsUndefined(deref) && js_strict_eq(ctx, token, deref)) {
+                /* found record, delete it */
+                js_finalization_registry_free_record(ctx->rt, r);
+                removed = TRUE;
+            }
+            JS_FreeValue(ctx, deref);
+        }
+    }
+    return JS_NewBool(ctx, removed);
+}
+
+/* FinalizationRegistry object finalize */
+static void js_finalization_registry_finalizer(JSRuntime *rt, JSValue val)
+{
+    JSObject *p = JS_VALUE_GET_OBJ(val);
+    JSFinalizationRegistry *reg = p->u.finalization_registry;
+    struct list_head *el, *el1;
+
+    JS_FreeValueRT(rt, reg->callback);
+    /* release all record */
+    list_for_each_safe(el, el1, &reg->record_list) {
+        JSFinalizationRecord *record =
+            list_entry(el, JSFinalizationRecord, list_in_registry);
+        js_finalization_registry_free_record(rt, record);
+    }
+
+    js_free_rt(rt, reg);
+}
+
+static void js_finalization_registry_mark(JSRuntime *rt, JSValueConst val,
+                                JS_MarkFunc *mark_func)
+{
+    JSObject *p = JS_VALUE_GET_OBJ(val);
+    JSFinalizationRegistry *reg = p->u.finalization_registry;
+    struct list_head *el;
+
+    JS_MarkValue(rt, reg->callback, mark_func);
+
+    /* mark all records */
+    list_for_each(el, &reg->record_list) {
+        JSFinalizationRecord *item =
+            list_entry(el, JSFinalizationRecord, list_in_registry);
+
+        JS_MarkValue(rt, item->held_value, mark_func);
+        JS_MarkValue(rt, item->token_weakref, mark_func);
+    }
+}
+
+static const JSCFunctionListEntry js_finalization_registry_proto_funcs[] = {
+    JS_CFUNC_DEF("register", 2, js_finalization_registry_register),
+    JS_CFUNC_DEF("unregister", 1, js_finalization_registry_unregister),
+    JS_PROP_STRING_DEF("[Symbol.toStringTag]", "FinalizationRegistry",
+                       JS_PROP_CONFIGURABLE),
+};
+
+static const JSClassShortDef js_finalization_registry_class_def[] = {
+    {
+        JS_ATOM_FinalizationRegistry,
+        js_finalization_registry_finalizer,
+        js_finalization_registry_mark
+    },
+};
+
+void JS_AddIntrinsicFinalizationRegistry(JSContext *ctx)
+{
+    JSValue proto;
+    if (!JS_IsRegisteredClass(ctx->rt, JS_CLASS_WEAKREF)) {
+        assert(!"ERROR: FinalizationRegistry depends on WeakRef");
+    }
+    if (!JS_IsRegisteredClass(ctx->rt, JS_CLASS_FINALIZATION_REGISTRY)) {
+        init_class_range(ctx->rt, js_finalization_registry_class_def,
+                         JS_CLASS_FINALIZATION_REGISTRY,
+                         countof(js_finalization_registry_class_def));
+    }
+    proto = JS_NewObject(ctx);
+    ctx->class_proto[JS_CLASS_FINALIZATION_REGISTRY] = proto;
+    JS_SetPropertyFunctionList(ctx, proto,
+                               js_finalization_registry_proto_funcs,
+                               countof(js_finalization_registry_proto_funcs));
+    JS_NewGlobalCConstructorOnly(ctx, "FinalizationRegistry",
+                                 js_finalization_registry_constructor, 1,
+                                 proto);
 }
 
 /* Set/Map/WeakSet/WeakMap */
