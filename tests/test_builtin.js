@@ -899,6 +899,102 @@ function test_weak_ref()
     })(scriptArgs.includes("benchmark"));
 }
 
+function test_finalization_registry()
+{
+    function await_job_loop(fr, block) {
+        // use promise to wait until next event loop
+        (async function run() {
+            await Promise.resolve().then(() => {
+                fr; // keep reference
+                try {
+                    block(fr);
+                } catch (e) {
+                    console.log("test_finalization_registry failure\n" + e + "\n" + e.stack)
+                    std.exit(1);
+                }
+            });
+        })();
+    }
+
+    (function case_register_unregister() {
+        var values = new Set();
+        var fr = new FinalizationRegistry((value) => {
+            values.add(value);
+        });
+        var token = {};
+        var obj = {};
+
+        fr.register(obj, 0, token);
+        assert(fr.unregister(token), true);
+
+        fr.register(obj, "1", undefined);
+
+        fr.register(obj, 2, undefined);
+
+        fr.register(Symbol("x"), "3");
+        obj = undefined;
+
+        await_job_loop(fr, () => {
+            assert(values.size, 3);
+            assert(values.has(0), false);
+            assert(values.has("1"), true);
+            assert(values.has(2), true);
+            assert(values.has("3"), true);
+
+        });
+    })();
+
+    (function case_fr_release_before_obj() {
+        var obj = {};
+        var called = false;
+        var fr = new FinalizationRegistry(() => { called = true; });
+        fr.register(obj, "");
+
+        fr = undefined;
+        obj = undefined;
+
+        await_job_loop(fr, () => assert(called, false));
+    })();
+
+    (function case_cyclic_ref() {
+        var obj = {};
+        var token = {};
+        var held_value = {};
+        var called = false;
+        var fr = new FinalizationRegistry(() => { called = true; });
+        fr.register(obj, held_value, token);
+
+        obj["ref"] = token;
+        token["ref"] = held_value;
+        held_value["ref"] = obj;
+        obj["ref2"] = fr;
+
+        std.gc(); /* force recycle cyclic reference */
+
+        await_job_loop(fr, () => assert(called, false));
+    })();
+
+    (function case_weakly_held_token() {
+        var token = {}
+        var obj = {}
+        var values = new Set();
+        var fr = new FinalizationRegistry(v => values.add(v));
+
+        fr.register(token, "token");
+        fr.register(obj, "obj", token); // token is weakly held
+
+        token = undefined;
+        /* token be released */
+        await_job_loop(fr, () => {
+            obj;
+            assert(values.has("token"), true);
+
+            obj = undefined;
+            await_job_loop(fr, () => assert(values.has("obj"), true));
+        });
+    })();
+}
+
 function test_generator()
 {
     function *f() {
@@ -974,4 +1070,5 @@ test_symbol();
 test_map();
 test_weak_map();
 test_weak_ref();
+test_finalization_registry();
 test_generator();
