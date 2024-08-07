@@ -10,6 +10,12 @@ function throw_error(msg) {
     status = 1;
 }
 
+function time(block) {
+  var start = Date.now();
+  block();
+  return Date.now() - start;
+}
+
 function assert(actual, expected, message) {
     function get_full_type(o) {
         var type = typeof(o);
@@ -716,13 +722,18 @@ function test_symbol()
 
 function test_map()
 {
+    var benchmark = scriptArgs.includes("benchmark");
     var a, i, n, tab, o, v;
     n = 1000;
+    if (benchmark) n *= 1000;
+    var start = Date.now();
 
     a = new Map();
-    for (var i = 0; i < n; i++) {
-        a.set(i, i);
-    }
+    var setInt = time(() => {
+        for (var i = 0; i < n; i++) {
+            a.set(i, i);
+        }
+    });
     a.set(-2147483648, 1);
     assert(a.get(-2147483648), 1);
     assert(a.get(-2147483647 - 1), 1);
@@ -732,19 +743,33 @@ function test_map()
     assert(a.get(1n), 1n);
     assert(a.get(2n**1000n - (2n**1000n - 1n)), 1n);
 
+    var getInt = time(() => {
+        for (var i = 0; i < n; i++) {
+            assert(a.get(i), i);
+        }
+    });
+
+    var iterateAndModify = time(() => {
+        a.forEach((v, o) => a.delete(o));
+    });
+
     a = new Map();
     tab = [];
-    for(i = 0; i < n; i++) {
-        v = { };
-        o = { id: i };
-        tab[i] = [o, v];
-        a.set(o, v);
-    }
+    var setObject = time(() => {
+        for(i = 0; i < n; i++) {
+            v = { };
+            o = { id: i };
+            tab[i] = [o, v];
+            a.set(o, v);
+        }
+    });
 
     assert(a.size, n);
-    for(i = 0; i < n; i++) {
-        assert(a.get(tab[i][0]), tab[i][1]);
-    }
+    var getObject = time(() => {
+        for(i = 0; i < n; i++) {
+            assert(a.get(tab[i][0]), tab[i][1]);
+        }
+    });
 
     i = 0;
     a.forEach(function (v, o) {
@@ -755,6 +780,11 @@ function test_map()
     });
 
     assert(a.size, 0);
+    if (benchmark) {
+        var total = Date.now() - start;
+        console.log("| set int | get int | set object | get object | iterate and modify | total |")
+        console.log(`| ${setInt} | ${getInt} | ${setObject} | ${getObject} | ${iterateAndModify} | ${total} |`)
+    }
 }
 
 function test_weak_map()
@@ -839,12 +869,6 @@ function test_weak_ref()
         obj["x"] = ref;
         std.gc();
     })();
-
-    function time(block) {
-        var start = Date.now();
-        block();
-        return Date.now() - start;
-    }
 
     /* performance and correctness */
     (function case_lots_of_weak(benchmark) {

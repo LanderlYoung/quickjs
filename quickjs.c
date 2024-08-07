@@ -1067,9 +1067,9 @@ typedef struct JSHashMap {
     struct list_head *bucket;
     struct list_head linked_entry;
     struct list_head iterators;
-    void *(*get_key)(JSHashEntry *entry);
-    uint32_t (*key_hash)(void *key);
-    BOOL (*key_equals)(void *key1, void *key2);
+    void *(*get_key)(struct JSHashMap *map, JSHashEntry *entry);
+    uint32_t (*key_hash)(struct JSHashMap *map, void *key);
+    BOOL (*key_equals)(struct JSHashMap *map, void *key1, void *key2);
 } JSHashMap;
 
 typedef struct JSHashEntryLinked {
@@ -1360,19 +1360,21 @@ static int js_hash_map_init(JSRuntime *rt, JSHashMap *map,
                             float load_factor, /* range in (0, 1] */
                             float shrink_factor, /* range in [0, load_factor) */
                             BOOL is_linked, /* linked hashmap preserves insertion order */
-                            void *(*get_key)(JSHashEntry *entry),
-                            uint32_t (*key_hash)(void *key),
-                            BOOL (*key_equals)(void *key1, void *key2));
+                            void *(*get_key)(JSHashMap *map, JSHashEntry *entry),
+                            uint32_t (*key_hash)(JSHashMap *map, void *key),
+                            BOOL (*key_equals)(JSHashMap *map, void *key1, void *key2));
 static void js_hash_map_release(JSRuntime *rt, JSHashMap *map,
                                 void (*free_entry)(JSRuntime *rt, JSHashEntry *entry, void *data), void *data);
 static size_t js_hash_map_size(JSHashMap *map);
 static JSHashEntry *js_hash_map_find_entry(JSHashMap *map, void *key);
 static int js_hash_map_add_entry(JSRuntime *rt, JSHashMap *map, JSHashEntry *entry);
 static void js_hash_map_del_entry(JSRuntime *rt, JSHashMap *map, JSHashEntry *entry);
+static void js_hash_map_init_entry(JSHashEntry *entry);
+static void js_hash_map_init_entry_linked(JSHashEntryLinked *entry);
 static JSHashEntry *js_hash_map_next_entry(JSHashMap *map, JSHashEntry *current);
 static void js_hash_map_iterator_init(JSHashMap *map, JSHashMapIterator *it);
 static JSHashEntryLinked *js_hash_map_iterator_next(JSHashMap *map, JSHashMapIterator *it);
-static void js_hash_map_iterator_release(JSHashMap *map, JSHashMapIterator *it);
+static void js_hash_map_iterator_release(JSHashMapIterator *it);
 
 static const JSClassExoticMethods js_arguments_exotic_methods;
 static const JSClassExoticMethods js_string_exotic_methods;
@@ -47090,9 +47092,9 @@ static int js_hash_map_init(JSRuntime *rt, JSHashMap *map,
                             float load_factor, /* range in (0, 1] */
                             float shrink_factor, /* range in [0, load_factor) */
                             BOOL is_linked, /* linked hashmap preserves insertion order */
-                            void *(*get_key)(JSHashEntry *entry),
-                            uint32_t (*key_hash)(void *key),
-                            BOOL (*key_equals)(void *key1, void *key2))
+                            void *(*get_key)(JSHashMap *map, JSHashEntry *entry),
+                            uint32_t (*key_hash)(JSHashMap *map, void *key),
+                            BOOL (*key_equals)(JSHashMap *map, void *key1, void *key2))
 {
     assert(load_factor > 0 && load_factor <= 1);
     assert(shrink_factor >= 0 && shrink_factor < load_factor);
@@ -47151,7 +47153,7 @@ static inline size_t js_hash_map_size(JSHashMap *map)
 
 static inline size_t __js_hash_map_bucket_index(JSHashMap *map, void *key)
 {
-    uint32_t hash = map->key_hash(key);
+    uint32_t hash = map->key_hash(map, key);
     /* spreads higher bits to lower */
     hash ^= hash >> 16;
     return hash & (map->capacity - 1);
@@ -47164,7 +47166,7 @@ static JSHashEntry *js_hash_map_find_entry(JSHashMap *map, void *key)
     struct list_head *bucket = &map->bucket[bucket_index];
     list_for_each(el, bucket) {
         JSHashEntry *entry = list_entry(el, JSHashEntry, list);
-        if (map->key_equals(map->get_key(entry), key)) {
+        if (map->key_equals(map, map->get_key(map, entry), key)) {
             return entry;
         }
     }
@@ -47185,12 +47187,13 @@ static int js_hash_map_add_entry(JSRuntime *rt, JSHashMap *map, JSHashEntry *ent
             return -1;
         }
     }
-    bucket_index = __js_hash_map_bucket_index(map, map->get_key(entry));
+    bucket_index = __js_hash_map_bucket_index(map, map->get_key(map, entry));
     list_add(&entry->list, &map->bucket[bucket_index]);
     map->size++;
 
     if (map->is_linked) {
         JSHashEntryLinked *l = container_of(entry, JSHashEntryLinked, entry);
+        assert(list_empty(&l->entry_list)); /* not added */
         list_add_tail(&l->entry_list, &map->linked_entry);
     }
 
@@ -47203,24 +47206,34 @@ static void __js_hash_map_iterator_fixup(JSHashMap *map, JSHashEntry *del_entry)
    If map is linked, the entry must from JSHashEntryLinked.entry */
 static void js_hash_map_del_entry(JSRuntime *rt, JSHashMap *map, JSHashEntry *entry)
 {
+    JSHashEntryLinked *l;
+    assert(entry->list.next != NULL);
     if (map->is_linked) {
         __js_hash_map_iterator_fixup(map, entry);
-    }
-
-    map->size--;
-    list_del(&entry->list); /* unlink form bucket */
-    if (map->is_linked) {
-        JSHashEntryLinked *l = container_of(entry, JSHashEntryLinked, entry);
+        /* unlink from map->linked_entry */
+        l = container_of(entry, JSHashEntryLinked, entry);
+        assert(l->entry_list.next != NULL);
         list_del(&l->entry_list);
     }
+    list_del(&entry->list); /* unlink form bucket */
+    map->size--;
 
     /* reduce size */
-    if (map->capacity > JS_HASH_MAP_DEFAULT_SIZE) {
-        float load = (map->size / (float)map->capacity);
-        if (load < map->shrink_factor) {
-            __js_hash_map_resize(rt, map, map->capacity >> 1);
-        }
+    if (map->capacity > JS_HASH_MAP_DEFAULT_SIZE &&
+        (map->size / (float)map->capacity) < map->shrink_factor) {
+        __js_hash_map_resize(rt, map, map->capacity >> 1);
     }
+}
+
+static void js_hash_map_init_entry(JSHashEntry *entry)
+{
+    init_list_head(&entry->list);
+}
+
+static void js_hash_map_init_entry_linked(JSHashEntryLinked *entry)
+{
+    js_hash_map_init_entry(&entry->entry);
+    init_list_head(&entry->entry_list);
 }
 
 static int __js_hash_map_resize(JSRuntime *rt, JSHashMap *map, size_t new_capacity)
@@ -47252,7 +47265,7 @@ static int __js_hash_map_resize(JSRuntime *rt, JSHashMap *map, size_t new_capaci
     for (i = 0; i < old_capacity; i++) {
         list_for_each_safe(el, el1, &old_bucket[i]) {
             JSHashEntry *entry = list_entry(el, JSHashEntry, list);
-            size_t new_index = __js_hash_map_bucket_index(map, map->get_key(entry));
+            size_t new_index = __js_hash_map_bucket_index(map, map->get_key(map, entry));
             list_del(&entry->list);
             list_add(&entry->list, &new_bucket[new_index]);
         }
@@ -47287,12 +47300,13 @@ static JSHashEntry *js_hash_map_next_entry(JSHashMap *map, JSHashEntry *current)
         }
         list = list->next;
         if (list != &map->linked_entry) {
-            return list_entry(current, JSHashEntry, list);
+            JSHashEntryLinked *l = list_entry(list, JSHashEntryLinked, entry_list);
+            return &l->entry;
         }
     } else {
         size_t index;
         if (current) {
-            index = map->key_hash(map->get_key(current));
+            index = map->key_hash(map, map->get_key(map, current));
             list = &current->list;
         } else {
             index = 0;
@@ -47302,7 +47316,7 @@ static JSHashEntry *js_hash_map_next_entry(JSHashMap *map, JSHashEntry *current)
         while (index < map->capacity) {
             list = list->next;
             if (list != &map->bucket[index]) {
-                return list_entry(current, JSHashEntry, list);
+                return list_entry(list, JSHashEntry, list);
             } else if (++index < map->capacity){
                 list = &map->bucket[index];
             }
@@ -47330,22 +47344,19 @@ static void js_hash_map_iterator_init(JSHashMap *map, JSHashMapIterator *it)
 
 static JSHashEntryLinked *js_hash_map_iterator_next(JSHashMap *map, JSHashMapIterator *it)
 {
-    if (it->end) {
-        return NULL;
-    }
-    if (likely(!it->fixed)) {
+    if (likely(!it->end && !it->fixed)) {
         JSHashEntry *next =
             js_hash_map_next_entry(map, it->current ? &it->current->entry : NULL);
         it->current = container_of(next, JSHashEntryLinked, entry);
         it->end = !next;
     } else {
-        /* fixed, already is current */
+        /* if fixed, already is current */
         it->fixed = FALSE;
     }
     return it->end ? NULL : it->current;
 }
 
-static void js_hash_map_iterator_release(JSHashMap *map, JSHashMapIterator *it)
+static void js_hash_map_iterator_release(JSHashMapIterator *it)
 {
     list_del(&it->list);
     it->end = TRUE; /* fail safe */
@@ -47364,7 +47375,7 @@ static void __js_hash_map_iterator_fixup(JSHashMap *map, JSHashEntry *del_entry)
     struct list_head *el;
     list_for_each(el, &map->iterators) {
         JSHashMapIterator *it = list_entry(el, JSHashMapIterator, list);
-        if (!it->end && &it->current->entry == del_entry) {
+        if (!it->end && del_entry == &it->current->entry) {
             js_hash_map_iterator_next(map, it);
             it->fixed = TRUE;
         }
@@ -47378,12 +47389,12 @@ typedef struct JSWeakTargetRecord {
     struct list_head weak_ref_list; /* value */
 } JSWeakTargetRecord;
 
-static void *__js_weak_ref_tr_get_key(JSHashEntry *entry)
+static void *__js_weak_ref_tr_get_key(JSHashMap *_, JSHashEntry *entry)
 {
     return container_of(entry, JSWeakTargetRecord, entry)->target_ptr;
 }
 
-static uint32_t __js_weak_ref_tr_key_hash(void *key)
+static uint32_t __js_weak_ref_tr_key_hash(JSHashMap *_, void *key)
 {
     uint32_t hash;
     if (sizeof(void *) == 8) {
@@ -47396,7 +47407,7 @@ static uint32_t __js_weak_ref_tr_key_hash(void *key)
     return hash;
 }
 
-static BOOL __js_weak_ref_tr_key_equals(void *key1, void *key2)
+static BOOL __js_weak_ref_tr_key_equals(JSHashMap *_, void *key1, void *key2)
 {
     return key1 == key2;
 }
@@ -47473,7 +47484,7 @@ static JSWeakTargetRecord *js_weak_ref_obtain_target_record(JSContext *ctx, JSVa
             return NULL;
         }
         entry = &record->entry;
-        init_list_head(&entry->list);
+        js_hash_map_init_entry(entry);
         record->target_ptr = target_ptr;
         init_list_head(&record->weak_ref_list);
 
@@ -47713,28 +47724,23 @@ void JS_AddIntrinsicWeakRef(JSContext *ctx)
 /* Set/Map/WeakSet/WeakMap */
 
 typedef struct JSMapRecord {
-    int ref_count; /* used during enumeration to avoid freeing the record */
-    BOOL empty; /* TRUE if the record is deleted */
-    struct JSMapState *map;
+    JSHashEntryLinked map_entry;
     JSWeakRecord weak_record; /* managed by JSWeakTargetRecord.weak_ref_list */
-    struct list_head link;
-    struct list_head hash_link;
+    struct JSMapState *map;
     JSValue key;
     JSValue value;
 } JSMapRecord;
 
 typedef struct JSMapState {
     BOOL is_weak; /* TRUE if WeakSet/WeakMap */
-    struct list_head records; /* list of JSMapRecord.link */
-    uint32_t record_count;
-    struct list_head *hash_table;
-    uint32_t hash_size; /* must be a power of two */
-    uint32_t record_count_threshold; /* count at which a hash table
-                                        resize is needed */
+    JSHashMap map; /* hash map */
+    JSContext *ctx;
 } JSMapState;
 
 #define MAGIC_SET (1 << 0)
 #define MAGIC_WEAK (1 << 1)
+
+static int __js_map_init_hash_map(JSContext *ctx, JSHashMap *map);
 
 static JSValue js_map_constructor(JSContext *ctx, JSValueConst new_target,
                                   int argc, JSValueConst *argv, int magic)
@@ -47752,15 +47758,12 @@ static JSValue js_map_constructor(JSContext *ctx, JSValueConst new_target,
     s = js_mallocz(ctx, sizeof(*s));
     if (!s)
         goto fail;
-    init_list_head(&s->records);
-    s->is_weak = is_weak;
-    JS_SetOpaque(obj, s);
-    s->hash_size = 1;
-    s->hash_table = js_malloc(ctx, sizeof(s->hash_table[0]) * s->hash_size);
-    if (!s->hash_table)
+    if (__js_map_init_hash_map(ctx, &s->map)) {
         goto fail;
-    init_list_head(&s->hash_table[0]);
-    s->record_count_threshold = 4;
+    }
+    s->is_weak = is_weak;
+    s->ctx = ctx;
+    JS_SetOpaque(obj, s);
 
     arr = JS_UNDEFINED;
     if (argc > 0)
@@ -47858,8 +47861,9 @@ static JSValueConst map_normalize_key(JSContext *ctx, JSValueConst key)
 }
 
 /* XXX: better hash ? */
-static uint32_t map_hash_key(JSContext *ctx, JSValueConst key)
+static uint32_t __js_map_hash_key(JSHashMap *_, void *key_)
 {
+    JSValueConst key = *(JSValueConst *)key_;
     uint32_t tag = JS_VALUE_GET_NORM_TAG(key);
     uint32_t h;
     double d;
@@ -47874,7 +47878,7 @@ static uint32_t map_hash_key(JSContext *ctx, JSValueConst key)
         break;
     case JS_TAG_OBJECT:
     case JS_TAG_SYMBOL:
-        h = (uintptr_t)JS_VALUE_GET_PTR(key) * 3163;
+        h = (uintptr_t)JS_VALUE_GET_PTR(key);
         break;
     case JS_TAG_INT:
         d = JS_VALUE_GET_INT(key);
@@ -47886,7 +47890,7 @@ static uint32_t map_hash_key(JSContext *ctx, JSValueConst key)
             d = JS_FLOAT64_NAN;
     hash_float64:
         u.d = d;
-        h = (u.u32[0] ^ u.u32[1]) * 3163;
+        h = u.u32[0] ^ u.u32[1];
         return h ^= JS_TAG_FLOAT64;
     default:
         h = 0; /* XXX: bignum support */
@@ -47896,52 +47900,41 @@ static uint32_t map_hash_key(JSContext *ctx, JSValueConst key)
     return h;
 }
 
+static void *__js_map_get_key(JSHashMap *_, JSHashEntry *entry)
+{
+    JSHashEntryLinked *l = container_of(entry, JSHashEntryLinked, entry);
+    JSMapRecord *s = container_of(l, JSMapRecord, map_entry);
+    return &s->key;
+}
+
+static BOOL __js_map_key_equals(JSHashMap *map, void *key1, void *key2)
+{
+    JSContext *ctx = container_of(map, JSMapState, map)->ctx;
+    return js_same_value_zero(ctx, *(JSValueConst *)key1, *(JSValueConst *)key2);
+}
+
+static int __js_map_init_hash_map(JSContext *ctx, JSHashMap *map)
+{
+    return js_hash_map_init(
+        ctx->rt, map,
+        JS_HASH_MAP_DEFAULT_SIZE,
+        JS_HASH_MAP_DEFAULT_LOAD_FACTOR,
+        JS_HASH_MAP_DEFAULT_SHRINK_FACTOR/*0*/,  // TODO: 0
+        TRUE,
+        __js_map_get_key,
+        __js_map_hash_key,
+        __js_map_key_equals);
+}
+
 static JSMapRecord *map_find_record(JSContext *ctx, JSMapState *s,
                                     JSValueConst key)
 {
-    struct list_head *el;
-    JSMapRecord *mr;
-    uint32_t h;
-    h = map_hash_key(ctx, key) & (s->hash_size - 1);
-    list_for_each(el, &s->hash_table[h]) {
-        mr = list_entry(el, JSMapRecord, hash_link);
-        if (js_same_value_zero(ctx, mr->key, key))
-            return mr;
+    JSHashEntry *e = js_hash_map_find_entry(&s->map, &key);
+    if (e) {
+        JSHashEntryLinked *l = container_of(e, JSHashEntryLinked, entry);
+        return container_of(l, JSMapRecord, map_entry);
     }
     return NULL;
-}
-
-static void map_hash_resize(JSContext *ctx, JSMapState *s)
-{
-    uint32_t new_hash_size, i, h;
-    size_t slack;
-    struct list_head *new_hash_table, *el;
-    JSMapRecord *mr;
-
-    /* XXX: no reporting of memory allocation failure */
-    if (s->hash_size == 1)
-        new_hash_size = 4;
-    else
-        new_hash_size = s->hash_size * 2;
-    new_hash_table = js_realloc2(ctx, s->hash_table,
-                                 sizeof(new_hash_table[0]) * new_hash_size, &slack);
-    if (!new_hash_table)
-        return;
-    new_hash_size += slack / sizeof(*new_hash_table);
-
-    for(i = 0; i < new_hash_size; i++)
-        init_list_head(&new_hash_table[i]);
-
-    list_for_each(el, &s->records) {
-        mr = list_entry(el, JSMapRecord, link);
-        if (!mr->empty) {
-            h = map_hash_key(ctx, mr->key) & (new_hash_size - 1);
-            list_add_tail(&mr->hash_link, &new_hash_table[h]);
-        }
-    }
-    s->hash_table = new_hash_table;
-    s->hash_size = new_hash_size;
-    s->record_count_threshold = new_hash_size * 2;
 }
 
 static void js_map_reset_weak_ref_first_pass(JSRuntime *rt, JSWeakRecord *wr);
@@ -47955,20 +47948,13 @@ static const JSWeakRecordOperations js_map_weak_operations = {
 static JSMapRecord *map_add_record(JSContext *ctx, JSMapState *s,
                                    JSValueConst key)
 {
-    uint32_t h;
-    JSMapRecord *mr;
-
-    mr = js_malloc(ctx, sizeof(*mr));
+    JSMapRecord *mr = js_malloc(ctx, sizeof(*mr));
     if (!mr)
         return NULL;
-    mr->ref_count = 1;
-    mr->map = s;
-    mr->empty = FALSE;
     if (s->is_weak) {
         JSWeakTargetRecord *target_record = js_weak_ref_obtain_target_record(ctx, key);
-        if (!target_record) {
-            js_free(ctx, mr);
-            return NULL;
+        if (unlikely(!target_record)) {
+            goto fail;
         }
         /* Add the weak reference */
         js_weak_record_init(&mr->weak_record, &js_map_weak_operations);
@@ -47976,58 +47962,37 @@ static JSMapRecord *map_add_record(JSContext *ctx, JSMapState *s,
     } else {
         JS_DupValue(ctx, key);
     }
+    mr->map = s;
     mr->key = (JSValue)key;
-    h = map_hash_key(ctx, key) & (s->hash_size - 1);
-    list_add_tail(&mr->hash_link, &s->hash_table[h]);
-    list_add_tail(&mr->link, &s->records);
-    s->record_count++;
-    if (s->record_count >= s->record_count_threshold) {
-        map_hash_resize(ctx, s);
+    js_hash_map_init_entry_linked(&mr->map_entry);
+    if (js_hash_map_add_entry(ctx->rt, &s->map, &mr->map_entry.entry)) {
+    fail:
+        js_free(ctx, mr);
+        return NULL;
     }
+
     return mr;
 }
 
-static void map_delete_record(JSRuntime *rt, JSMapState *s, JSMapRecord *mr)
+static void map_delete_record(JSRuntime *rt, JSMapState *s, JSMapRecord *mr, BOOL delete_entry)
 {
-    if (mr->empty)
-        return;
-    list_del(&mr->hash_link);
     if (s->is_weak) {
         js_weak_ref_unlink(&mr->weak_record);
     } else {
         JS_FreeValueRT(rt, mr->key);
     }
     JS_FreeValueRT(rt, mr->value);
-    if (--mr->ref_count == 0) {
-        list_del(&mr->link);
-        js_free_rt(rt, mr);
-    } else {
-        /* keep a zombie record for iterators */
-        mr->empty = TRUE;
-        mr->key = JS_UNDEFINED;
-        mr->value = JS_UNDEFINED;
+    if (delete_entry) {
+        js_hash_map_del_entry(rt, &s->map, &mr->map_entry.entry);
     }
-    s->record_count--;
-}
-
-static void map_decref_record(JSRuntime *rt, JSMapRecord *mr)
-{
-    if (--mr->ref_count == 0) {
-        /* the record can be safely removed */
-        assert(mr->empty);
-        list_del(&mr->link);
-        js_free_rt(rt, mr);
-    }
+    js_free_rt(rt, mr);
 }
 
 static void js_map_reset_weak_ref_first_pass(JSRuntime *rt, JSWeakRecord *wr)
 {
     JSMapRecord *mr = container_of(wr, JSMapRecord, weak_record);
     JSMapState *s = mr->map;
-    assert(s->is_weak);
-    assert(!mr->empty); /* no iterator on WeakMap/WeakSet */
-    list_del(&mr->hash_link);
-    list_del(&mr->link);
+    js_hash_map_del_entry(rt, &s->map, &mr->map_entry.entry);
 }
 
 static void js_map_reset_weak_ref_second_pass(JSRuntime *rt, JSWeakRecord *wr)
@@ -48107,7 +48072,7 @@ static JSValue js_map_delete(JSContext *ctx, JSValueConst this_val,
     mr = map_find_record(ctx, s, key);
     if (!mr)
         return JS_FALSE;
-    map_delete_record(ctx->rt, s, mr);
+    map_delete_record(ctx->rt, s, mr, TRUE);
     return JS_TRUE;
 }
 
@@ -48115,14 +48080,15 @@ static JSValue js_map_clear(JSContext *ctx, JSValueConst this_val,
                             int argc, JSValueConst *argv, int magic)
 {
     JSMapState *s = JS_GetOpaque2(ctx, this_val, JS_CLASS_MAP + magic);
-    struct list_head *el, *el1;
-    JSMapRecord *mr;
+    JSHashEntry *entry;
 
     if (!s)
         return JS_EXCEPTION;
-    list_for_each_safe(el, el1, &s->records) {
-        mr = list_entry(el, JSMapRecord, link);
-        map_delete_record(ctx->rt, s, mr);
+
+    while ((entry = js_hash_map_next_entry(&s->map, NULL))) {
+        JSHashEntryLinked *l = container_of(entry, JSHashEntryLinked, entry);
+        JSMapRecord *mr = container_of(l, JSMapRecord, map_entry);
+        map_delete_record(ctx->rt, s, mr, TRUE);
     }
     return JS_UNDEFINED;
 }
@@ -48132,16 +48098,17 @@ static JSValue js_map_get_size(JSContext *ctx, JSValueConst this_val, int magic)
     JSMapState *s = JS_GetOpaque2(ctx, this_val, JS_CLASS_MAP + magic);
     if (!s)
         return JS_EXCEPTION;
-    return JS_NewUint32(ctx, s->record_count);
+    return JS_NewUint32(ctx, js_hash_map_size(&s->map));
 }
 
 static JSValue js_map_forEach(JSContext *ctx, JSValueConst this_val,
                               int argc, JSValueConst *argv, int magic)
 {
     JSMapState *s = JS_GetOpaque2(ctx, this_val, JS_CLASS_MAP + magic);
+    JSHashMapIterator iterator;
+    JSHashEntryLinked *entry;
     JSValueConst func, this_arg;
     JSValue ret, args[3];
-    struct list_head *el;
     JSMapRecord *mr;
 
     if (!s)
@@ -48153,34 +48120,30 @@ static JSValue js_map_forEach(JSContext *ctx, JSValueConst this_val,
         this_arg = JS_UNDEFINED;
     if (check_function(ctx, func))
         return JS_EXCEPTION;
-    /* Note: the list can be modified while traversing it, but the
-       current element is locked */
-    el = s->records.next;
-    while (el != &s->records) {
-        mr = list_entry(el, JSMapRecord, link);
-        if (!mr->empty) {
-            mr->ref_count++;
-            /* must duplicate in case the record is deleted */
-            args[1] = JS_DupValue(ctx, mr->key);
-            if (magic)
-                args[0] = args[1];
-            else
-                args[0] = JS_DupValue(ctx, mr->value);
-            args[2] = (JSValue)this_val;
-            ret = JS_Call(ctx, func, this_arg, 3, (JSValueConst *)args);
-            JS_FreeValue(ctx, args[0]);
-            if (!magic)
-                JS_FreeValue(ctx, args[1]);
-            el = el->next;
-            map_decref_record(ctx->rt, mr);
-            if (JS_IsException(ret))
-                return ret;
-            JS_FreeValue(ctx, ret);
-        } else {
-            el = el->next;
-        }
+
+    /* Note: the list can be modified while traversing it */
+    js_hash_map_iterator_init(&s->map, &iterator);
+    while ((entry = js_hash_map_iterator_next(&s->map, &iterator))) {
+        mr = container_of(entry, JSMapRecord, map_entry);
+        /* must duplicate in case the record is deleted */
+        args[1] = JS_DupValue(ctx, mr->key);
+        if (magic)
+            args[0] = args[1];
+        else
+            args[0] = JS_DupValue(ctx, mr->value);
+        args[2] = (JSValue)this_val;
+        ret = JS_Call(ctx, func, this_arg, 3, (JSValueConst *)args);
+        JS_FreeValue(ctx, args[0]);
+        if (!magic)
+            JS_FreeValue(ctx, args[1]);
+        if (JS_IsException(ret))
+            goto done;
+        JS_FreeValue(ctx, ret);
     }
-    return JS_UNDEFINED;
+    ret = JS_UNDEFINED;
+done:
+    js_hash_map_iterator_release(&iterator);
+    return ret;
 }
 
 static JSValue js_object_groupBy(JSContext *ctx, JSValueConst this_val,
@@ -48300,30 +48263,22 @@ static JSValue js_object_groupBy(JSContext *ctx, JSValueConst this_val,
     return JS_EXCEPTION;
 }
 
+static void __js_map_free_entry(JSRuntime *rt, JSHashEntry *entry, void *data)
+{
+    JSHashEntryLinked *l = container_of(entry, JSHashEntryLinked, entry);
+    JSMapRecord *mr = container_of(l, JSMapRecord, map_entry);
+    map_delete_record(rt, (JSMapState *)data, mr, FALSE);
+}
+
 static void js_map_finalizer(JSRuntime *rt, JSValue val)
 {
     JSObject *p;
     JSMapState *s;
-    struct list_head *el, *el1;
-    JSMapRecord *mr;
 
     p = JS_VALUE_GET_OBJ(val);
     s = p->u.map_state;
     if (s) {
-        /* if the object is deleted we are sure that no iterator is
-           using it */
-        list_for_each_safe(el, el1, &s->records) {
-            mr = list_entry(el, JSMapRecord, link);
-            if (!mr->empty) {
-                if (s->is_weak)
-                    js_weak_ref_unlink(&mr->weak_record);
-                else
-                    JS_FreeValueRT(rt, mr->key);
-                JS_FreeValueRT(rt, mr->value);
-            }
-            js_free_rt(rt, mr);
-        }
-        js_free_rt(rt, s->hash_table);
+        js_hash_map_release(rt, &s->map, __js_map_free_entry, s);
         js_free_rt(rt, s);
     }
 }
@@ -48332,13 +48287,13 @@ static void js_map_mark(JSRuntime *rt, JSValueConst val, JS_MarkFunc *mark_func)
 {
     JSObject *p = JS_VALUE_GET_OBJ(val);
     JSMapState *s;
-    struct list_head *el;
-    JSMapRecord *mr;
+    JSHashEntry *entry = NULL;
 
     s = p->u.map_state;
     if (s) {
-        list_for_each(el, &s->records) {
-            mr = list_entry(el, JSMapRecord, link);
+        while ((entry = js_hash_map_next_entry(&s->map, entry))) {
+            JSHashEntryLinked *l = container_of(entry, JSHashEntryLinked, entry);
+            JSMapRecord *mr = container_of(l, JSMapRecord, map_entry);
             if (!s->is_weak)
                 JS_MarkValue(rt, mr->key, mark_func);
             JS_MarkValue(rt, mr->value, mark_func);
@@ -48349,9 +48304,9 @@ static void js_map_mark(JSRuntime *rt, JSValueConst val, JS_MarkFunc *mark_func)
 /* Map Iterator */
 
 typedef struct JSMapIteratorData {
-    JSValue obj;
+    JSValue obj; /* the Map/Set instance */
     JSIteratorKindEnum kind;
-    JSMapRecord *cur_record;
+    JSHashMapIterator iterator;
 } JSMapIteratorData;
 
 static void js_map_iterator_finalizer(JSRuntime *rt, JSValue val)
@@ -48364,8 +48319,8 @@ static void js_map_iterator_finalizer(JSRuntime *rt, JSValue val)
     if (it) {
         /* During the GC sweep phase the Map finalizer may be
            called before the Map iterator finalizer */
-        if (JS_IsLiveObject(rt, it->obj) && it->cur_record) {
-            map_decref_record(rt, it->cur_record);
+        if (JS_IsLiveObject(rt, it->obj)) {
+            js_hash_map_iterator_release(&it->iterator);
         }
         JS_FreeValueRT(rt, it->obj);
         js_free_rt(rt, it);
@@ -48407,7 +48362,7 @@ static JSValue js_create_map_iterator(JSContext *ctx, JSValueConst this_val,
     }
     it->obj = JS_DupValue(ctx, this_val);
     it->kind = kind;
-    it->cur_record = NULL;
+    js_hash_map_iterator_init(&s->map, &it->iterator);
     JS_SetOpaque(enum_obj, it);
     return enum_obj;
  fail:
@@ -48421,7 +48376,7 @@ static JSValue js_map_iterator_next(JSContext *ctx, JSValueConst this_val,
     JSMapIteratorData *it;
     JSMapState *s;
     JSMapRecord *mr;
-    struct list_head *el;
+    JSHashEntryLinked *entry;
 
     it = JS_GetOpaque2(ctx, this_val, JS_CLASS_MAP_ITERATOR + magic);
     if (!it) {
@@ -48432,36 +48387,16 @@ static JSValue js_map_iterator_next(JSContext *ctx, JSValueConst this_val,
         goto done;
     s = JS_GetOpaque(it->obj, JS_CLASS_MAP + magic);
     assert(s != NULL);
-    if (!it->cur_record) {
-        el = s->records.next;
-    } else {
-        mr = it->cur_record;
-        el = mr->link.next;
-        map_decref_record(ctx->rt, mr); /* the record can be freed here */
-    }
-    for(;;) {
-        if (el == &s->records) {
-            /* no more record  */
-            it->cur_record = NULL;
-            JS_FreeValue(ctx, it->obj);
-            it->obj = JS_UNDEFINED;
-        done:
-            /* end of enumeration */
-            *pdone = TRUE;
-            return JS_UNDEFINED;
-        }
-        mr = list_entry(el, JSMapRecord, link);
-        if (!mr->empty)
-            break;
-        /* get the next record */
-        el = mr->link.next;
+
+    entry = js_hash_map_iterator_next(&s->map, &it->iterator);
+    if (!entry) {
+    done:
+        *pdone = TRUE;
+        return JS_UNDEFINED;
     }
 
-    /* lock the record so that it won't be freed */
-    mr->ref_count++;
-    it->cur_record = mr;
     *pdone = FALSE;
-
+    mr = container_of(entry, JSMapRecord, map_entry);
     if (it->kind == JS_ITERATOR_KIND_KEY) {
         return JS_DupValue(ctx, mr->key);
     } else {
