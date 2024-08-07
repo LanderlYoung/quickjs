@@ -1063,15 +1063,26 @@ typedef struct JSHashMap {
     size_t size;
     float load_factor; /* range in (0, 1] */
     float shrink_factor; /* range in [0, load_factor) */
+    BOOL is_linked; /* linked hashmap preserves insertion order */
     struct list_head *bucket;
+    struct list_head linked_entry;
+    struct list_head iterators;
     void *(*get_key)(JSHashEntry *entry);
     uint32_t (*key_hash)(void *key);
     BOOL (*key_equals)(void *key1, void *key2);
 } JSHashMap;
 
+typedef struct JSHashEntryLinked {
+    JSHashEntry entry;
+    struct list_head entry_list;
+} JSHashEntryLinked;
+
 typedef struct JSHashMapIterator {
-    size_t index;
-    JSHashEntry *current;
+    /* all fields are implement details, don't access directly */
+    JSHashEntryLinked *current;
+    struct list_head list;
+    BOOL end;
+    BOOL fixed;
 } JSHashMapIterator;
 
 static int JS_InitAtoms(JSRuntime *rt);
@@ -1348,6 +1359,7 @@ static int js_hash_map_init(JSRuntime *rt, JSHashMap *map,
                             size_t initial_size, /* pow of two */
                             float load_factor, /* range in (0, 1] */
                             float shrink_factor, /* range in [0, load_factor) */
+                            BOOL is_linked, /* linked hashmap preserves insertion order */
                             void *(*get_key)(JSHashEntry *entry),
                             uint32_t (*key_hash)(void *key),
                             BOOL (*key_equals)(void *key1, void *key2));
@@ -1357,7 +1369,10 @@ static size_t js_hash_map_size(JSHashMap *map);
 static JSHashEntry *js_hash_map_find_entry(JSHashMap *map, void *key);
 static int js_hash_map_add_entry(JSRuntime *rt, JSHashMap *map, JSHashEntry *entry);
 static void js_hash_map_del_entry(JSRuntime *rt, JSHashMap *map, JSHashEntry *entry);
-static int js_hash_map_iterate_next_entry(JSHashMap *map, JSHashMapIterator *it);
+static JSHashEntry *js_hash_map_next_entry(JSHashMap *map, JSHashEntry *current);
+static void js_hash_map_iterator_init(JSHashMap *map, JSHashMapIterator *it);
+static JSHashEntryLinked *js_hash_map_iterator_next(JSHashMap *map, JSHashMapIterator *it);
+static void js_hash_map_iterator_release(JSHashMap *map, JSHashMapIterator *it);
 
 static const JSClassExoticMethods js_arguments_exotic_methods;
 static const JSClassExoticMethods js_string_exotic_methods;
@@ -47074,6 +47089,7 @@ static int js_hash_map_init(JSRuntime *rt, JSHashMap *map,
                             size_t initial_size, /* must be pow of two */
                             float load_factor, /* range in (0, 1] */
                             float shrink_factor, /* range in [0, load_factor) */
+                            BOOL is_linked, /* linked hashmap preserves insertion order */
                             void *(*get_key)(JSHashEntry *entry),
                             uint32_t (*key_hash)(void *key),
                             BOOL (*key_equals)(void *key1, void *key2))
@@ -47087,9 +47103,12 @@ static int js_hash_map_init(JSRuntime *rt, JSHashMap *map,
     map->bucket = NULL;
     map->load_factor = load_factor;
     map->shrink_factor = shrink_factor;
+    map->is_linked = is_linked;
     map->get_key = get_key;
     map->key_hash = key_hash;
     map->key_equals = key_equals;
+    init_list_head(&map->linked_entry);
+    init_list_head(&map->iterators);
     if (unlikely(__js_hash_map_resize(rt, map, initial_size))) {
         return -1;
     }
@@ -47100,18 +47119,26 @@ static int js_hash_map_init(JSRuntime *rt, JSHashMap *map,
 static void js_hash_map_release(JSRuntime *rt, JSHashMap *map,
                                 void (*free_entry)(JSRuntime *rt, JSHashEntry *entry, void *data), void *data)
 {
-    JSHashMapIterator it = { 0 };
-    while(!js_hash_map_iterate_next_entry(map, &it)) {
-        JSHashEntry *entry = it.current;
+    JSHashEntry *entry;
+    while((entry = js_hash_map_next_entry(map, NULL))) {
         list_del(&entry->list);
+        if (map->is_linked) {
+            JSHashEntryLinked *l = container_of(entry, JSHashEntryLinked, entry);
+            list_del(&l->entry_list);
+        }
         if (free_entry) {
             free_entry(rt, entry, data);
         }
-        it.current = NULL;
     }
     js_free_rt(rt, map->bucket);
 
     /* fail safe */
+    if (map->is_linked) {
+        struct list_head *el;
+        list_for_each(el, &map->iterators) {
+            list_entry(el, JSHashMapIterator, list)->end = TRUE;
+        }
+    }
     map->capacity = 0;
     map->size = 0;
     map->bucket = NULL;
@@ -47144,12 +47171,13 @@ static JSHashEntry *js_hash_map_find_entry(JSHashMap *map, void *key)
     return NULL;
 }
 
-/* remember to init_list_head(entry->entry.list) */
+/* Remember to init_list_head(entry->entry.list).
+  If map is linked, the entry must from JSHashEntryLinked.entry */
 static int js_hash_map_add_entry(JSRuntime *rt, JSHashMap *map, JSHashEntry *entry)
 {
     size_t bucket_index;
     assert(entry);
-    assert(list_empty(&entry->list) || !entry->list.next); /* not added */
+    assert(list_empty(&entry->list)); /* not added */
 
     /* enlarge size */
     if ((map->size + 1) > map->capacity * map->load_factor) {
@@ -47161,14 +47189,30 @@ static int js_hash_map_add_entry(JSRuntime *rt, JSHashMap *map, JSHashEntry *ent
     list_add(&entry->list, &map->bucket[bucket_index]);
     map->size++;
 
+    if (map->is_linked) {
+        JSHashEntryLinked *l = container_of(entry, JSHashEntryLinked, entry);
+        list_add_tail(&l->entry_list, &map->linked_entry);
+    }
+
     return 0;
 }
 
-/* delete entry from map, DOES NOT free(entry) */
+static void __js_hash_map_iterator_fixup(JSHashMap *map, JSHashEntry *del_entry);
+
+/* Delete entry from map, DOES NOT free(entry).
+   If map is linked, the entry must from JSHashEntryLinked.entry */
 static void js_hash_map_del_entry(JSRuntime *rt, JSHashMap *map, JSHashEntry *entry)
 {
+    if (map->is_linked) {
+        __js_hash_map_iterator_fixup(map, entry);
+    }
+
     map->size--;
     list_del(&entry->list); /* unlink form bucket */
+    if (map->is_linked) {
+        JSHashEntryLinked *l = container_of(entry, JSHashEntryLinked, entry);
+        list_del(&l->entry_list);
+    }
 
     /* reduce size */
     if (map->capacity > JS_HASH_MAP_DEFAULT_SIZE) {
@@ -47218,38 +47262,113 @@ static int __js_hash_map_resize(JSRuntime *rt, JSHashMap *map, size_t new_capaci
     return 0;
 }
 
-/* 1. it.current == NULL returns first entry
-   2. when enumeration ends returns -1 and set it.current to NULL otherwise return 0. 
-   Note: DO NOT modify hash map during iterating.
+/* 1. current == NULL returns first entry
+   2. when enumeration ends returns NULL.
+   Note: current must be a valid entry in map or NULL.
+   For a safe modification during iteration, a linked hashmap can be used togather with
+   js_hash_map_iterator_* functions.
+
+   If map is linked, the order is inserting order of entry, otherwise is undefined.
    */
-static int js_hash_map_iterate_next_entry(JSHashMap *map, JSHashMapIterator *it)
+static JSHashEntry *js_hash_map_next_entry(JSHashMap *map, JSHashEntry *current)
 {
-    size_t index;
-    struct list_head *current;
+    struct list_head *list;
 
     if (!map->size) {
-        return -1;
+        return NULL;
     }
 
-    if (it->current) {
-        index = it->index;
-        current = &it->current->list;
+    if (map->is_linked) {
+        if (current) {
+            JSHashEntryLinked *l = container_of(current, JSHashEntryLinked, entry);
+            list = &l->entry_list;
+        } else {
+            list = &map->linked_entry;
+        }
+        list = list->next;
+        if (list != &map->linked_entry) {
+            return list_entry(current, JSHashEntry, list);
+        }
     } else {
-        index = 0;
-        current = &map->bucket[0];
-    }
+        size_t index;
+        if (current) {
+            index = map->key_hash(map->get_key(current));
+            list = &current->list;
+        } else {
+            index = 0;
+            list = &map->bucket[0];
+        }
 
-    while (index < map->capacity) {
-        current = current->next;
-        if (current != &map->bucket[index]) {
-            it->index = index;
-            it->current = list_entry(current, JSHashEntry, list);
-            return 0;
-        } else if (++index < map->capacity){
-            current = &map->bucket[index];
+        while (index < map->capacity) {
+            list = list->next;
+            if (list != &map->bucket[index]) {
+                return list_entry(current, JSHashEntry, list);
+            } else if (++index < map->capacity){
+                list = &map->bucket[index];
+            }
         }
     }
-    return -1;
+    return NULL;
+}
+
+/* Can only be used for linked hashmap, ie. JSHashMap.is_linked == TRUE.
+   A paired js_hash_map_iterator_next call is REQUIRED when done with iterator.
+
+   Modifying map during iteration is ALLOWED.
+
+   Note: in case of map freeed before iterator, don't use the iterator any more.
+   */
+static void js_hash_map_iterator_init(JSHashMap *map, JSHashMapIterator *it)
+{
+    assert(map->is_linked);
+    it->current = NULL;
+    it->end = FALSE;
+    it->fixed = FALSE;
+    init_list_head(&it->list);
+    list_add(&it->list, &map->iterators);
+}
+
+static JSHashEntryLinked *js_hash_map_iterator_next(JSHashMap *map, JSHashMapIterator *it)
+{
+    if (it->end) {
+        return NULL;
+    }
+    if (likely(!it->fixed)) {
+        JSHashEntry *next =
+            js_hash_map_next_entry(map, it->current ? &it->current->entry : NULL);
+        it->current = container_of(next, JSHashEntryLinked, entry);
+        it->end = !next;
+    } else {
+        /* fixed, already is current */
+        it->fixed = FALSE;
+    }
+    return it->end ? NULL : it->current;
+}
+
+static void js_hash_map_iterator_release(JSHashMap *map, JSHashMapIterator *it)
+{
+    list_del(&it->list);
+    it->end = TRUE; /* fail safe */
+}
+
+static void __js_hash_map_iterator_fixup(JSHashMap *map, JSHashEntry *del_entry)
+{
+    /* In order to support modification during iterating, we keep track of all
+       iterators, finding ones pointing to del_entry, and update them to the next one.
+
+       DISCUSSION: Another implementation is to keep deleted entry as zombie,
+       and requires ref-count to manage entries, which is more complicated.
+
+       This implementation is simpler, supposing there won't be too much
+       iterators, thusing iterating through them won't be a performance concer. */
+    struct list_head *el;
+    list_for_each(el, &map->iterators) {
+        JSHashMapIterator *it = list_entry(el, JSHashMapIterator, list);
+        if (!it->end && &it->current->entry == del_entry) {
+            js_hash_map_iterator_next(map, it);
+            it->fixed = TRUE;
+        }
+    }
 }
 
 /* JSObject/Atom weak support */
@@ -47291,6 +47410,7 @@ static JSHashMap * js_weak_ref_obtain_runtime_map(JSRuntime *rt)
                              JS_HASH_MAP_DEFAULT_SIZE, 
                              JS_HASH_MAP_DEFAULT_LOAD_FACTOR,
                              JS_HASH_MAP_DEFAULT_SHRINK_FACTOR,
+                             FALSE,
                              __js_weak_ref_tr_get_key,
                              __js_weak_ref_tr_key_hash,
                              __js_weak_ref_tr_key_equals)) {
