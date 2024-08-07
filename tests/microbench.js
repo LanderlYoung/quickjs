@@ -1141,6 +1141,34 @@ function weakref(n)
     return n * 3;
 }
 
+function map_get_set(n)
+{
+    var a, tab, o, v;
+    a = new Map();
+    for (var i = 0; i < n; i++) {
+        a.set(i, i);
+    }
+    for (var i = 0; i < n; i++) {
+        a.get(i);
+    }
+    a.forEach((v, o) => a.delete(o));
+
+    a = new Map();
+    tab = [];
+    for(var i = 0; i < n; i++) {
+        v = { };
+        o = { id: i };
+        tab[i] = [o, v];
+        a.set(o, v);
+    }
+    for(var i = 0; i < n; i++) {
+        a.get(tab[i][0]);
+    }
+    a.forEach((v, o) => a.delete(o));
+
+    return n * 2;
+}
+
 function load_result(filename)
 {
     var has_filename = filename;
@@ -1264,6 +1292,7 @@ function main(argc, argv, g)
         string_to_int,
         string_to_float,
         weakref,
+        map_get_set,
     ];
     var tests = [];
     var i, j, n, f, name, found;
