@@ -192,7 +192,7 @@ CONFIG_SHARED_LIBS=y # building shared libraries is supported
 endif
 endif
 
-PROGS=qjs$(EXE) qjsc$(EXE) run-test262
+PROGS=qjs$(EXE) qjsc$(EXE) run-test262 quickjs_test$(EXE)
 ifneq ($(CROSS_PREFIX),)
 QJSC_CC=gcc
 QJSC=./host-qjsc
@@ -370,6 +370,12 @@ regexp_test: libregexp.c libunicode.c cutils.c
 unicode_gen: $(OBJDIR)/unicode_gen.host.o $(OBJDIR)/cutils.host.o libunicode.c unicode_gen_def.h
 	$(HOST_CC) $(LDFLAGS) $(CFLAGS) -o $@ $(OBJDIR)/unicode_gen.host.o $(OBJDIR)/cutils.host.o
 
+quickjs_test$(EXE): tests/quickjs_test.c $(OBJDIR)/libregexp.o $(OBJDIR)/libunicode.o $(OBJDIR)/cutils.o $(OBJDIR)/quickjs-libc.o $(OBJDIR)/libbf.o
+	$(CC) $(LDFLAGS) $(CFLAGS) -o $@ tests/quickjs_test.c $(OBJDIR)/libregexp.o $(OBJDIR)/libunicode.o $(OBJDIR)/cutils.o $(OBJDIR)/quickjs-libc.o $(OBJDIR)/libbf.o $(LIBS)
+
+run_quickjs_test: quickjs_test$(EXE)
+	./quickjs_test$(EXE)
+
 clean:
 	rm -f repl.c qjscalc.c out.c
 	rm -f *.a *.o *.d *~ unicode_gen regexp_test fuzz_eval fuzz_compile fuzz_regexp $(PROGS)
@@ -463,7 +469,7 @@ ifdef CONFIG_M32
 test: qjs32
 endif
 
-test: qjs
+test: qjs run_quickjs_test
 	./qjs tests/test_closure.js
 	./qjs tests/test_language.js
 	./qjs --std tests/test_builtin.js
