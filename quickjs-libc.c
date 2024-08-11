@@ -22,6 +22,7 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
  * THE SOFTWARE.
  */
+#include "quickjs.h"
 #include <stdlib.h>
 #include <stdio.h>
 #include <stdarg.h>
@@ -731,6 +732,16 @@ static JSValue js_std_gc(JSContext *ctx, JSValueConst this_val,
                          int argc, JSValueConst *argv)
 {
     JS_RunGC(JS_GetRuntime(ctx));
+    return JS_UNDEFINED;
+}
+
+static JSValue js_std_dump_memory(JSContext *ctx, JSValueConst this_val,
+                         int argc, JSValueConst *argv)
+{
+    JSRuntime *rt = JS_GetRuntime(ctx);
+    JSMemoryUsage stats;
+    JS_ComputeMemoryUsage(rt, &stats);
+    JS_DumpMemoryUsage(stdout, &stats, rt);
     return JS_UNDEFINED;
 }
 
@@ -1511,6 +1522,7 @@ static const JSCFunctionListEntry js_std_error_props[] = {
 static const JSCFunctionListEntry js_std_funcs[] = {
     JS_CFUNC_DEF("exit", 1, js_std_exit ),
     JS_CFUNC_DEF("gc", 0, js_std_gc ),
+    JS_CFUNC_DEF("dumpMemory", 0, js_std_dump_memory),
     JS_CFUNC_DEF("evalScript", 1, js_evalScript ),
     JS_CFUNC_DEF("loadScript", 1, js_loadScript ),
     JS_CFUNC_DEF("getenv", 1, js_std_getenv ),
