@@ -77,6 +77,31 @@
 #define CONFIG_STACK_CHECK
 #endif
 
+#undef assert
+#include <execinfo.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+/* Obtain a backtrace and print it to stdout. */
+void print_trace(void)
+{
+  void *array[10];
+  size_t size;
+  char **strings;
+  size_t i;
+  size = backtrace(array, 10);
+  strings = backtrace_symbols(array, size);
+  for (i = 0; i < size; i++)
+     printf ("%s\n", strings[i]);
+  free (strings);
+}
+
+#define assert(e) do { BOOL FAIL = !(e); if (FAIL) print_trace(); \
+    (__builtin_expect(FAIL, 0) ? __assert_rtn(__func__, __ASSERT_FILE_NAME, __LINE__, #e) : (void)0); \
+} while (0);
+
+
+
 
 /* dump object free */
 //#define DUMP_FREE
@@ -47183,7 +47208,7 @@ static int js_hash_map_add_entry(JSRuntime *rt, JSHashMap *map, JSHashEntry *ent
 
     /* enlarge size */
     if ((map->size + 1) > map->capacity * map->load_factor) {
-        if (unlikely(__js_hash_map_resize(rt, map, map->size << 1))) {
+        if (unlikely(__js_hash_map_resize(rt, map, map->capacity << 1))) {
             return -1;
         }
     }
@@ -47919,7 +47944,7 @@ static int __js_map_init_hash_map(JSContext *ctx, JSHashMap *map)
         ctx->rt, map,
         JS_HASH_MAP_DEFAULT_SIZE,
         JS_HASH_MAP_DEFAULT_LOAD_FACTOR,
-        JS_HASH_MAP_DEFAULT_SHRINK_FACTOR/*0*/,  // TODO: 0
+        JS_HASH_MAP_DEFAULT_SHRINK_FACTOR,
         TRUE,
         __js_map_get_key,
         __js_map_hash_key,

@@ -1,9 +1,13 @@
 /* test quickjs.c internal functions */
-#include "../quickjs.c" /* HACK: include c file to access static functions */
+#include "../quickjs.c.h" /* HACK: include c file to access static functions */
 
 void test_hash_map(JSRuntime *rt)
 {
     JSHashMap map;
+    js_hash_map_init(rt, &map, 
+                     JS_HASH_MAP_DEFAULT_SIZE,
+                     float load_factor, float shrink_factor, int is_linked, void *(*get_key)(JSHashMap *, JSHashEntry *), uint32_t (*key_hash)(JSHashMap *, void *), int (*BOOL)(int *))
+
 }
 
 void test_weak_ref(JSRuntime *rt)
