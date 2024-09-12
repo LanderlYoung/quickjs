@@ -270,5 +270,6 @@ DEF(Symbol_asyncIterator, "Symbol.asyncIterator")
 DEF(Symbol_operatorSet, "Symbol.operatorSet")
 #endif
 DEF(WeakRef, "WeakRef")
+DEF(FinalizationRegistry, "FinalizationRegistry")
 
 #endif /* DEF */

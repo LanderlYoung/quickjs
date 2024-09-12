@@ -377,6 +377,8 @@ void JS_AddIntrinsicBigInt(JSContext *ctx);
 void JS_AddIntrinsicBigFloat(JSContext *ctx);
 void JS_AddIntrinsicBigDecimal(JSContext *ctx);
 void JS_AddIntrinsicWeakRef(JSContext *ctx);
+/* depends on WeakRef */
+void JS_AddIntrinsicFinalizationRegistry(JSContext *ctx);
 /* enable operator overloading */
 void JS_AddIntrinsicOperators(JSContext *ctx);
 /* enable "use math" */

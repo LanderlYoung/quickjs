@@ -78,6 +78,7 @@ static const FeatureEntry feature_list[] = {
     { "module-loader", NULL },
     { "bigint", "BigInt" },
     { "weakref", "WeakRef" },
+    { "finalization-registry", "FinalizationRegistry" },
 };
 
 void namelist_add(namelist_t *lp, const char *name, const char *short_name,
